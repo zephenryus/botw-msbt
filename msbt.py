@@ -1,5 +1,7 @@
 import argparse
+import collections
 import os
+import re
 import struct
 
 import yaml
@@ -27,7 +29,7 @@ class MSBT:
 
     def read_file(self, path):
         self.filename = os.path.basename(path)
-        print("Reading {0}...".format(self.filename))
+        print("Reading {0}...".format(path))
 
         with open(path, 'rb') as infile:
             signature = infile.read(0x08)
@@ -81,6 +83,7 @@ class MSBT:
 
         texts = []
         text_string = b''
+        meta_data = []
         for index in range(len(header) - 1):
             infile.seek(offset_table_start + header[index]['text_offset'])
 
@@ -97,6 +100,15 @@ class MSBT:
 
                 utf_16_bytes = struct.unpack('>2s', infile.read(2))[0]
 
+                if utf_16_bytes == b'\x00\x0e':
+                    string_pos, string_meta_data = self.get_action_data(infile, meta_data, string_pos, len(text_string))
+                    # if string_meta_data['data'][3] == b'\x00\x0a':
+                    #     utf_16_bytes = b'\x00\x20'
+                    # else:
+                    continue
+                    # Replace data with a space
+                    # utf_16_bytes = b'\x00\x20'
+
                 # Replace carriage return with a space for text output
                 if utf_16_bytes == b'\x00\x0a':
                     utf_16_bytes = b'\x00\x20'
@@ -104,13 +116,45 @@ class MSBT:
                 text_string += utf_16_bytes
 
             text_string = text_string.rstrip(b'\x00')
-            texts.append(text_string.decode('UTF-16-BE'))
+            texts.append({
+                'meta': meta_data,
+                'string': re.sub('\s+', ' ', text_string.decode('UTF-16-BE'))
+            })
             text_string = b''
+            meta_data = []
 
         return {
             'header': header,
             'texts': texts
         }
+
+    def get_action_data(self, infile, meta_data, string_pos, insertion_offset):
+        string_meta_data = {
+            'offset': insertion_offset,
+            'type': struct.unpack('>H', infile.read(2))[0],
+            'data': []
+        }
+
+        string_pos += 2
+
+        attribute_count = 3
+
+        if string_meta_data['type'] == 0:
+            attribute_count = 3
+        elif string_meta_data['type'] == 1:
+            attribute_count = 5
+        elif string_meta_data['type'] == 3:
+            attribute_count = 3
+        elif string_meta_data['type'] == 5:
+            attribute_count = 2
+
+        for _ in range(attribute_count):
+            string_meta_data['data'].append(hex(struct.unpack('>H', infile.read(2))[0]))
+            string_pos += 2
+
+        meta_data.append(string_meta_data)
+
+        return string_pos, string_meta_data
 
     def read_label_section(self, infile):
         section_signature = infile.read(0x04)
@@ -179,28 +223,36 @@ class MSBT:
         offset_table_start = infile.tell()
         section_stop = offset_table_start + section_size
 
-        offset_count = struct.unpack('>2I', infile.read(8))
+        offset_count, attribute_data_size = struct.unpack('>2I', infile.read(8))
+
+        if attribute_data_size > 0:
+            print('This file has attributes!')
 
         header = []
         for _ in range(offset_count):
-            header.append({
-                'attribute_offset': struct.unpack('>I', infile.read(4))[0]
-            })
+            if attribute_data_size == 4:
+                header.append({
+                    'attribute_offset': struct.unpack('>I', infile.read(4))[0]
+                })
+            else:
+                header.append({
+                    'attribute_offset': 0
+                })
 
         attributes = []
         attribute_string = b''
-        while True:
-            if infile.tell() + 2 > section_stop:
-                break
+        for index in range(offset_count):
+            infile.seek(offset_table_start + header[index]['attribute_offset'])
 
-            utf_16_bytes = struct.unpack('>2s', infile.read(2))[0]
+            while True:
+                utf_16_bytes = struct.unpack('>2s', infile.read(2))[0]
 
-            if utf_16_bytes == b'\x00\x00':
-                attributes.append(attribute_string.decode('UTF-16-BE'))
-                attribute_string = b''
-                continue
+                if utf_16_bytes == b'\x00\x00':
+                    attributes.append(attribute_string.decode('UTF-16-BE'))
+                    attribute_string = b''
+                    break
 
-            attribute_string += utf_16_bytes
+                attribute_string += utf_16_bytes
 
         # Remove empty strings from list
         # attributes = [x for x in attributes if x != '']
@@ -244,27 +296,31 @@ class MSBT:
     def compile_data(self, data_object):
         compiled = {}
 
-        print(data_object[0]['labels']['header'])
-        print(data_object[0]['labels']['labels'])
-        print(data_object[1]['attributes']['header'])
-        print(data_object[1]['attributes']['attributes'])
-        print(data_object[2]['texts']['header'])
-        print(data_object[2]['texts']['texts'])
+        # print(data_object[0]['labels']['header'])
+        # print(data_object[0]['labels']['labels'])
+        # print(data_object[1]['attributes']['header'])
+        # print(data_object[1]['attributes']['attributes'])
+        # print(data_object[2]['texts']['header'])
+        # print(data_object[2]['texts']['texts'])
 
         for index in range(len(data_object[0]['labels']['labels'])):
             label = data_object[0]['labels']['labels'][index]
             label_name = label['label']
             label_index = label['index']
-            label_text = data_object[2]['texts']['texts'][label_index]
 
+            label_text = data_object[2]['texts']['texts'][label_index]['string']
+            meta_data = data_object[2]['texts']['texts'][label_index]['meta']
             attributes = data_object[1]['attributes']['attributes'][label_index]
 
             compiled[label_name] = {
                 'text': label_text,
-                'attributes': attributes
+                'attributes': attributes,
+                'meta': meta_data
             }
 
-        return compiled
+        compiled_sorted = collections.OrderedDict(sorted(compiled.items()))
+
+        return compiled_sorted
 
 
 def main():
@@ -274,8 +330,8 @@ def main():
     # args = parser.parse_args()
 
     # Use for single file
-    # msbt = MSBT("C:\\botw-data\\decompressed\\content\\Pack\\Bootup_USen\\Message\\Msg_USen.product\\EventFlowMsg\\100enemy.msbt")
-    # save_as_json(msbt.data_object, "C:\\Users\\zephe\\PycharmProjects\\msbt\\output\\json\\100enemy.msbt")
+    # msbt = MSBT("C:\\botw-data\\decompressed\\content\\Pack\\Bootup_USen\\Message\\Msg_USen.product\\EventFlowMsg\\UotoriMini_RecipeSea.msbt")
+    # save_as_json(msbt.data_object, "C:\\Users\\zephe\\PycharmProjects\\msbt\\output\\json\\UotoriMini_RecipeSea.msbt")
 
     # Use for directory
     path = "C:\\botw-data\\decompressed\\content\\Pack\\Bootup_USen\\Message\\Msg_USen.product"
@@ -284,8 +340,6 @@ def main():
         directory = dirpath.replace('\\', '/') + '/'
 
         for filename in filenames:
-            print(directory + filename)
-
             msbt = MSBT(directory + filename)
 
             output_path = "C:\\Users\\zephe\\PycharmProjects\\msbt\\output\\json\\{0}".format(filename)
